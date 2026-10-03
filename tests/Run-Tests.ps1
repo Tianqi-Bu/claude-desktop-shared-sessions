@@ -74,7 +74,7 @@ try {
     Assert (Test-Path -LiteralPath (Join-Path $f.Bk (((U 'c') + '__' + (U 'd')) + '\backlog'))) 'replaced folder kept whole in backup'
 
     Write-Host "`n[3] check passes; rerun is a no-op"
-    $r = Run $check @{ SessionRoots = $f.Roots }
+    $r = Run $check @{ SessionRoots = $f.Roots; SkipDoctor = $true }
     Assert ($r.Out -match 'PASS  one shared list' -and $r.Out -match 'PASS  link') 'check passes'
     $snap = Snapshot $f.A
     $r = Run $link @{ SessionRoots = $f.Roots; Apply = $true; BackupDir = (Join-Path $f.Base 'bk2') }
@@ -84,7 +84,7 @@ try {
     Write-Host "`n[4] a new login appears and gets linked"
     $N = Join-Path $f.R2 ((U 'e') + '\' + (U 'f'))
     Rec $N (U '7') 100
-    $r = Run $check @{ SessionRoots = $f.Roots }
+    $r = Run $check @{ SessionRoots = $f.Roots; SkipDoctor = $true }
     Assert ($r.Out -match 'FAIL  one shared list' -and $r.Code -eq 1) 'check flags the separate list'
     $r = Run $link @{ SessionRoots = $f.Roots; Apply = $true; BackupDir = (Join-Path $f.Base 'bk3') }
     Assert ((IsLink $N) -and (Names $N).Count -eq 6) 'new login linked and sees all 6'
@@ -142,7 +142,7 @@ try {
     $f = New-Fixture
     Rec $f.A (U '1') 5000 -Damaged; Rec $f.A (U '5') 10; Rec $f.A (U '6') 10
     Rec $f.P (U '1') 10; Rec $f.P (U '5') 5000 -Damaged
-    $r = Run $check @{ SessionRoots = $f.Roots }
+    $r = Run $check @{ SessionRoots = $f.Roots; SkipDoctor = $true }
     Assert ($r.Out -match 'WARN  unlinked records  2 session') 'check counts damaged records'
     $r = Run $link @{ SessionRoots = $f.Roots; Apply = $true; BackupDir = $f.Bk }
     Assert ((Field $f.A (U '1') 'cliSessionId') -ne '') 'healthy older copy replaced the damaged one'
@@ -152,7 +152,7 @@ try {
     $f = New-Fixture
     Rec $f.A (U '1') 100; Rec $f.A (U '5') 100
     Rec $f.P (U '1') 999 -Bom; Rec $f.P (U '2') 100 -Bom
-    $r = Run $check @{ SessionRoots = $f.Roots }
+    $r = Run $check @{ SessionRoots = $f.Roots; SkipDoctor = $true }
     Assert ($r.Out -match 'WARN  unreadable records  2 session') 'check reports BOM records'
     $r = Run $link @{ SessionRoots = $f.Roots; Apply = $true; BackupDir = $f.Bk }
     Assert ($r.Out -match '2 record\(s\) here are unreadable') 'warns about them'
@@ -165,7 +165,7 @@ try {
     Rec $f.A (U '1') 100 -Title 'GOOD'; Rec $f.A (U '5') 1
     New-Item -ItemType Directory -Path $f.P -Force | Out-Null
     [IO.File]::WriteAllText((Join-Path $f.P ('local_' + (U '1') + '.json')), ('{"sessionId":"local_' + (U '1') + '","cliSessionId":"' + (U '1') + '","lastActivityAt":999,"title":"TRUNC'), $utf8)
-    $r = Run $check @{ SessionRoots = $f.Roots }
+    $r = Run $check @{ SessionRoots = $f.Roots; SkipDoctor = $true }
     Assert ($r.Out -match 'WARN  unreadable records  1 session') 'check reports the truncated record'
     $r = Run $link @{ SessionRoots = $f.Roots; Apply = $true; BackupDir = $f.Bk }
     Assert ((Field $f.A (U '1') 'title') -eq 'GOOD') 'truncated newer copy did not replace the good one'
@@ -230,7 +230,7 @@ try {
     Rec $f.A (U '1') 1; Rec $f.A (U '5') 1; Rec $f.P (U '2') 1
     $r = Run $link @{ SessionRoots = $f.Roots; Apply = $true; BackupDir = $f.Bk }
     Rename-Item -LiteralPath $f.A -NewName 'gone'
-    $r = Run $check @{ SessionRoots = $f.Roots }
+    $r = Run $check @{ SessionRoots = $f.Roots; SkipDoctor = $true }
     Assert ($r.Out -match 'FAIL  shared list missing' -and $r.Code -eq 1) 'check reports the missing list'
     $r = Run $unlink @{ SessionRoots = $f.Roots; Apply = $true }
     Assert ($r.Code -eq 1 -and (IsLink $f.P)) 'unlink refuses to replace a link whose list is gone'
@@ -252,6 +252,19 @@ try {
     try { $r = Run $unlink @{ SessionRoots = $f.Roots; Apply = $true } } finally { $h.Close() }
     Assert ($r.Code -eq 1 -and (IsLink $f.P)) 'link kept'
     Assert (-not (Test-Path -LiteralPath ($f.P + '.cslink-unlink'))) 'no staging folder left behind'
+
+    Write-Host "`n[19] check reports settings that 'claude doctor' says are invalid"
+    $f = New-Fixture
+    Rec $f.A (U '1') 1
+    $badStub = Join-Path $f.Base 'claude-bad.cmd'; $okStub = Join-Path $f.Base 'claude-ok.cmd'
+    [IO.File]::WriteAllText($badStub, "@echo off`r`necho Claude Code doctor`r`necho Invalid settings`r`necho - settings.json: attribution.commit: Expected string, but received undefined`r`necho Multiple installations found`r`n")
+    [IO.File]::WriteAllText($okStub, "@echo off`r`necho Claude Code doctor`r`necho Running: native`r`n")
+    $r = Run $check @{ SessionRoots = $f.Roots; ClaudeCommand = $badStub }
+    Assert ($r.Out -match 'FAIL  settings valid .*attribution\.commit' -and $r.Code -eq 1) 'invalid settings reported as FAIL'
+    $r = Run $check @{ SessionRoots = $f.Roots; ClaudeCommand = $okStub }
+    Assert ($r.Out -match "PASS  settings valid" -and $r.Out -notmatch 'FAIL  settings valid') 'valid settings reported as PASS'
+    $r = Run $check @{ SessionRoots = $f.Roots; ClaudeCommand = (Join-Path $f.Base 'missing.exe') }
+    Assert ($r.Out -match 'WARN  settings valid') 'missing claude CLI is a warning, not a failure'
 
     Write-Host "`n[15] a backup folder on another drive is refused"
     $f = New-Fixture

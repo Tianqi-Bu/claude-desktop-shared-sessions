@@ -3,7 +3,11 @@
 #   powershell -ExecutionPolicy Bypass -File .\Check-ClaudeSwitch.ps1
 # Prints PASS / WARN / FAIL per check; exits 1 if anything FAILed.
 
-param([string[]]$SessionRoots)   # optional: override root discovery (used by the tests)
+param(
+    [string[]]$SessionRoots,   # optional: override root discovery (used by the tests)
+    [string]$ClaudeCommand,    # optional: the claude CLI to run 'doctor' with (default: claude on PATH)
+    [switch]$SkipDoctor        # skip the 'claude doctor' settings check
+)
 
 $ErrorActionPreference = 'Continue'
 . (Join-Path $PSScriptRoot 'common.ps1')
@@ -88,6 +92,47 @@ print(json.dumps({'off': off, 'keys': keys}))
             $missing = @(@($res.keys) | Where-Object { $sj -notmatch ('"' + [regex]::Escape($_) + '"\s*:') })
             if ($missing.Count -gt 0) { Say FAIL 'settings.json intact' ("missing from settings.json: " + ($missing -join ', ')) }
             elseif (@($res.keys).Count -gt 0) { Say PASS 'settings.json intact' "$(@($res.keys).Count) shared keys present" }
+        }
+    }
+}
+
+# 4. Claude Code must accept settings.json. If any value is invalid, Claude Code ignores the
+#    whole file, which silently disables every plugin, hook and permission in it.
+#    'claude doctor' lists such errors under "Invalid settings".
+if (-not $SkipDoctor) {
+    $exe = $ClaudeCommand
+    if (-not $exe) {
+        $c = Get-Command claude -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($c) { $exe = $c.Source }
+    }
+    if (-not $exe) { Say WARN 'settings valid' "claude CLI not found on PATH; could not run 'claude doctor'" }
+    else {
+        $psi = New-Object Diagnostics.ProcessStartInfo
+        $psi.FileName = $exe; $psi.Arguments = 'doctor'
+        $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = [Text.Encoding]::UTF8; $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
+        $text = $null
+        try {
+            $proc = [Diagnostics.Process]::Start($psi)
+            $proc.StandardInput.Close()
+            $so = $proc.StandardOutput.ReadToEndAsync(); $se = $proc.StandardError.ReadToEndAsync()
+            if ($proc.WaitForExit(90000)) { $text = $so.Result + "`n" + $se.Result }
+            else { try { $proc.Kill() } catch {} }
+        } catch {}
+        if ($text -eq $null) { Say WARN 'settings valid' "'claude doctor' did not run or did not finish; skipped" }
+        else {
+            $lines = @(($text -replace "\x1b\[[0-9;?]*[A-Za-z]", '') -split "`r?`n" | ForEach-Object { $_.Trim() })
+            $at = [Array]::IndexOf($lines, 'Invalid settings')
+            if ($at -ge 0) {
+                $bad = @()
+                for ($i = $at + 1; $i -lt $lines.Count -and $lines[$i].StartsWith('-'); $i++) { $bad += $lines[$i].TrimStart('-', ' ') }
+                Say FAIL 'settings valid' ("Claude Code ignores your settings file (plugins, hooks and permissions are off): " + ($bad -join '; '))
+            } elseif ($text -match '(?i)doctor') {
+                Say PASS 'settings valid' "'claude doctor' reports no invalid settings"
+            } else {
+                Say WARN 'settings valid' "unexpected output from 'claude doctor'; skipped"
+            }
         }
     }
 }

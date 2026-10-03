@@ -120,6 +120,8 @@ CC Switch 3.20.4 切换渠道时会**整个重写** `~/.claude/settings.json`。
 
 修法：在 CC Switch 的通用配置片段里放好你的设置，并在**每个** Claude 渠道上勾选"写入通用配置"。装了 Python 时，体检脚本会检查这一项，并核对通用配置里的键都还在 `settings.json` 里。
 
+**`settings.json` 里只要有一个值不合法，Claude Code 就会忽略整个文件**，所有插件、hooks、权限一起失效，而且不会弹任何提示。例如某些版本只接受字符串形式的 `"attribution": {"commit": "", "pr": ""}`，写成 `false` 就会触发。所以体检脚本会调用 `claude doctor`，它报告 "Invalid settings" 时判为 FAIL。
+
 CC Switch 给桌面端第三方模式用的是一个固定的配置 ID，所以在 CC Switch 里换中转不会产生新目录。第一次用 CC Switch，或者改用别的第三方配置方式时，可能会多出一个目录，体检会提示，再接入一次就行。
 
 ## 撤销与恢复
@@ -149,7 +151,7 @@ CC Switch 给桌面端第三方模式用的是一个固定的配置 ID，所以�
 powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1
 ```
 
-测试在 `%TEMP%` 下搭建一套假的目录结构，跑完会清理。测试不会修改本机的真实数据；不过体检相关的用例会只读地读取本机的 `settings.json` 和 CC Switch 数据库。
+测试在 `%TEMP%` 下搭建一套假的目录结构，跑完会清理。测试不会修改本机的真实数据；不过体检相关的用例会只读地读取本机的 `settings.json` 和 CC Switch 数据库。`claude doctor` 那一项用假的 `claude` 程序测试，不会运行真的 CLI。
 
 覆盖的情况有：
 
@@ -167,6 +169,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1
 - 路径含空格、方括号、中文时正常
 - 备份目录在别的盘上时拒绝执行
 - 主列表丢失时的体检结果和撤销行为，以及 `-AllowEmpty`
+- `claude doctor` 报告设置无效时，体检判为 FAIL
 - 撤销中途失败时联接保持原样
 - 链接全部失败时不写主列表标记
 - 读不了的文件不会中止运行
@@ -179,7 +182,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1
 |---|---|
 | `Link-ClaudeAccounts.ps1` | 合并并链接，默认空跑 |
 | `Connect-NewLogin.ps1` | 双击用的中文引导，内部调用 Link 和 Check |
-| `Check-ClaudeSwitch.ps1` | 只读体检 |
+| `Check-ClaudeSwitch.ps1` | 只读体检：共享列表和链接、坏卡片、`CLAUDE_CONFIG_DIR`、对话保留期、CC Switch 通用配置，以及用 `claude doctor` 确认 `settings.json` 有效 |
 | `Unlink-ClaudeAccounts.ps1` | 撤销链接 |
 | `common.ps1` | 公共函数 |
 | `tests\Run-Tests.ps1` | 自动化测试 |
@@ -208,7 +211,7 @@ Switching Claude accounts, or pointing Claude Desktop at a third-party gateway (
   - Master tombstones are respected. The master's original copies and the replaced folders are kept in a same-drive backup.
   - Linked roots are refused; a probe file guards against moving the master; the new link is read back and verified; a failed link rolls the folder back.
 - `Connect-NewLogin.ps1` is a guided, double-click wrapper (Chinese prompts).
-- `Check-ClaudeSwitch.ps1` is a read-only health check: one shared list, valid links, missing master, unreadable or unlinked records, `CLAUDE_CONFIG_DIR`, transcript retention, and CC Switch common-config coverage.
+- `Check-ClaudeSwitch.ps1` is a read-only health check: one shared list, valid links, missing master, unreadable or unlinked records, `CLAUDE_CONFIG_DIR`, transcript retention, CC Switch common-config coverage, and `settings.json` validity via `claude doctor` (one invalid value makes Claude Code ignore the whole file, silently turning off every plugin, hook and permission; use `-SkipDoctor` to skip this check).
 - `Unlink-ClaudeAccounts.ps1` turns links back into real folders, each holding a full copy of the list. It stages the copy first and restores the link if the swap fails. If the master is missing it refuses; `-AllowEmpty` replaces the broken links with empty folders. The backup holds each login's folder from before linking, never the shared list itself.
 - `common.ps1` holds shared helpers. `tests\Run-Tests.ps1` runs self-contained tests on fake folders under `%TEMP%`; they read the real `settings.json` and CC Switch database read-only, and never modify them.
 
