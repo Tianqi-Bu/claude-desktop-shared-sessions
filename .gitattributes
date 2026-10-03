@@ -1,0 +1,5 @@
+# Windows PowerShell scripts: CRLF on checkout, bytes otherwise untouched
+# (Connect-NewLogin.ps1 is UTF-8 with BOM on purpose so PowerShell 5.1 shows its Chinese prompts).
+*.ps1 text eol=crlf
+*.md  text
+LICENSE text
