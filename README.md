@@ -1,222 +1,226 @@
 # claude-desktop-shared-sessions
 
-**Claude Desktop 共享会话列表（Windows）** · Share one Claude Desktop session list across accounts and third-party gateways
-
-换 Claude 账号、或者用 CC Switch 之类的工具切到第三方中转后，Claude 桌面端 Code 标签里的会话列表就空了。这个项目让本机所有登录方式共用**同一份**会话列表：打开 Claude，之前的对话都在，点开就能接着干。
+**Claude 桌面端换号不丢对话（Windows）** · Keep one Claude Desktop session list across accounts and third-party gateways
 
 [English below](#english)
 
-## 原理
+Claude 额度用完换个号、或者用 CC Switch 切到第三方中转之后，Claude 桌面端 Code 标签左边的对话列表就变了：之前的对话找不到，接不上之前的工作。这个项目让本机所有登录方式看到**同一份**对话列表，换号后点开就能接着干。
 
-对话内容本来就是共用的，存在 `%USERPROFILE%\.claude\projects\*.jsonl`，跟登录哪个号无关。
+> ⚠️ 2026-10-09 之前的版本用的是 NTFS 联接（junction），**会导致对话卡片悄悄存不进去**，请升级。安装脚本会自动把旧版的联接换回普通文件夹。详见下面的「为什么不能用联接」。
 
-桌面端只是把"会话列表"按登录方式分开存：
+## 它是怎么工作的
 
-```
-<数据目录>\claude-code-sessions\<账号ID>\<组织ID>\local_*.json
-```
+对话分两部分存：
 
-- 官方账号的数据目录：`%APPDATA%\Claude`（商店版在 `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude`）
-- 第三方 / 网关模式：`%LOCALAPPDATA%\Claude-3p`
+| 内容 | 位置 | 换号会不会变 |
+|---|---|---|
+| 对话正文（每句话、每次工具调用） | `%USERPROFILE%\.claude\projects\…\<对话ID>.jsonl` | 不会，所有号共用一份 |
+| 左边列表里的"卡片"（标题、时间、指向哪个正文文件） | `<桌面端数据目录>\claude-code-sessions\<账号ID>\<组织ID>\local_*.json` | **会**，每种登录方式各有一个文件夹 |
 
-换号或切第三方，桌面端就去读另一个空目录。本项目选一个目录作为主列表，把其他目录都换成指向它的 NTFS 目录联接（junction）。这样所有登录读写的都是同一组文件，不需要定时同步，也不会出现两份副本越改越不一样。
+数据目录：官方账号在 `%APPDATA%\Claude`（商店版实际位于 `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude`），第三方 / 网关模式在 `%LOCALAPPDATA%\Claude-3p`。
 
-- 不需要管理员权限，不装后台程序或计划任务，不修改 Claude 本体，不联网
-- 只用 Windows 自带的 Windows PowerShell 5.1（PowerShell 7 未测试），源码可以直接读
-- 不复制、不改写对话内容
+所以对话从来没丢，丢的是"目录卡片"。本项目借助 Claude Code 自带的 [hooks](https://code.claude.com/docs/en/hooks)，在下面这些时刻，自动把所有登录方式的卡片合并成同一份：
 
-## 用法
+- Claude 回完一句话（`Stop`），并在 3 秒、10 秒后各补一次。补跑是因为桌面端会在 hook 结束后才写入这一轮最后的卡片更新；
+- 因为额度限制等原因被迫中断（`StopFailure`），这正是最常需要换号的时候；
+- 打开、关闭一个对话（`SessionStart` / `SessionEnd`）。
 
-下载：`git clone https://github.com/Tianqi-Bu/claude-desktop-shared-sessions.git`，或在 GitHub 页面点 Code → Download ZIP 后解压（解压后可对文件夹运行 `Get-ChildItem -Recurse | Unblock-File`）。
+脚本不常驻后台，没有计划任务，也不修改 Claude 本体。只用 Windows 自带的 PowerShell 5.1，不联网，**不读写对话正文**，也**不消耗 token**：作为 hook 运行时不输出任何内容。
 
-### 最简单：双击
+### 合并规则
 
-1. 新账号（或新的第三方配置）登录一次，打开一次 Code 标签。这一步是让桌面端先把这个登录的目录建出来。
-2. 右键 `Connect-NewLogin.ps1` →「使用 PowerShell 运行」，按中文提示操作：
-   - 先退出 Claude
-   - 预览要做的改动
-   - 回车确认后执行
-   - 执行完自动体检
+两边都有同一张卡片时，按下面的顺序决定保留哪份，选出的那份会复制到所有登录方式：
 
-   想放到桌面上：新建一个快捷方式，目标填
-   ```
-   powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<本项目路径>\Connect-NewLogin.ps1"
-   ```
-3. 重新打开 Claude。
+1. **桌面端能读的**。带 BOM、空文件、截断或损坏的 JSON 不会被扩散；如果它是 15 秒内刚改过的，会被视为"正在写入"，这一轮先不碰它。
+2. **没有过时的**。对话压缩或 `/clear` 之后，卡片会换到新的正文文件，并在 `priorCliSessionIds` / `preClearCliSessionId` 里记下旧的。仍然指向旧文件的副本永远不会胜出，否则你会接回旧的进度。
+3. **没被桌面端标成"找不到正文"的**（`transcriptUnavailable`）。
+4. **`lastActivityAt` 更新的**，相同时比较文件修改时间更新的。
 
-### 命令行
+其他规则：
+
+- 在某个号里删除的对话（`deleted_<id>` 墓碑），会在所有号里删除；之后又被恢复或导入的除外。
+- 读不了的卡片、列不出的文件夹，这一轮都不写。
+- 写入是原子操作（先写临时文件再替换），读取时不会挡住桌面端保存。
+
+### 备份
+
+位置：`%USERPROFILE%\claude-session-sync-backup\`
+
+- 每天第一次同步时，把所有卡片完整快照一份，保留 14 天。
+- 每次替换或删除卡片之前，先存一份旧的（相同内容只存一份），保留 3 天。
+- 整个文件夹上限 300 MB，超过就先删最旧的。
+- 日志 `sync.log` 每次同步写一行，满 1 MB 自动轮换，最多约 2 MB。
+
+## 安装
 
 ```powershell
-# 从托盘右键退出 Claude（Claude 在运行时，脚本会拒绝执行 -Apply）
-powershell -ExecutionPolicy Bypass -File .\Link-ClaudeAccounts.ps1          # 空跑：只显示计划，不改动任何东西
-powershell -ExecutionPolicy Bypass -File .\Link-ClaudeAccounts.ps1 -Apply   # 执行
-powershell -ExecutionPolicy Bypass -File .\Check-ClaudeSwitch.ps1           # 体检：只读，Claude 开着也能跑
+git clone https://github.com/Tianqi-Bu/claude-desktop-shared-sessions.git
+cd claude-desktop-shared-sessions
+powershell -ExecutionPolicy Bypass -File .\Install-SyncHook.ps1
 ```
 
-`-ExecutionPolicy Bypass` 只对这一次运行生效，不会改系统设置。如果你的电脑由组策略强制了执行策略，这个参数无效，请先对下载的脚本运行 `Unblock-File`，或者联系管理员。
+如果是下载 ZIP 解压的，先对文件夹运行一次 `Get-ChildItem -Recurse | Unblock-File`。
 
-## 主列表
+安装脚本会做这些事：
 
-- 第一次执行时，主列表选**官方数据目录里会话最多的那个目录**；只有官方目录不存在时，才会用第三方目录。
-- 选定后，脚本会在主列表里放一个标记文件 `.claude-session-link-master`。以后撤销再链接，主列表也不会换。
-- 如需手动指定，用 `-Master <目录>`。
-- 脚本每次都会打印主列表在哪。
+1. 把脚本复制到 `%USERPROFILE%\.claude-session-sync\`。
+2. 把旧版留下的联接文件夹换回普通文件夹。这一步需要先从托盘退出 Claude，脚本会提示你。
+3. 把 hooks 加进 `%USERPROFILE%\.claude\settings.json`。你原有的其他设置和 hooks 一个字节都不动，重复运行也不会重复添加，改之前会先备份。
+4. 如果装了 [CC Switch](https://github.com/farion1231/cc-switch)，把同样的 hooks 写进它的 Claude 通用配置（需要 Python）。
+5. 同步一次，跑一遍体检，在桌面放一个「Sync Claude Sessions」快捷方式。
 
-## 合并规则
+`-ExecutionPolicy Bypass` 只对这一次运行有效，不改系统设置。
 
-执行 `-Apply` 时，被换成联接的目录里的会话卡片会先合并进主列表。两边都有同一张卡片时，按下面的顺序决定保留哪份：
+## 日常使用
 
-1. **桌面端能读的优先。** 带 UTF-8 BOM 的、空文件、解析不了的 JSON（例如写到一半被截断），桌面端都会跳过。这种卡片不会被复制，也不会覆盖别的卡片。
-2. **完好的优先。** 桌面端找不到对话文件时，会清掉卡片里的 `cliSessionId` 并标记 `transcriptUnavailable`（[anthropics/claude-code#63082](https://github.com/anthropics/claude-code/issues/63082)），这种卡片不会覆盖完好的卡片。
-3. **`lastActivityAt` 更新的优先。**
-4. **文件修改时间更新的优先。** 比如在另一个登录里改了标题或归档了会话。
+**什么都不用做，正常换号即可。** 只需要记住一条：**等 Claude 回完这一句再换号。**
 
-其他情况：
+- 一个**从没登录过**的新号第一次登录时，列表可能是空的（它的文件夹刚建出来）。切到别的号再切回来，或者重启一次 Claude 就好。
+- 改名、归档、删除这类只在界面上做的操作，要等下一句回完才会同步过去，只影响显示。
+- 想确认状态，双击桌面的「Sync Claude Sessions」：它会立即同步一次并做体检，最后显示 `No failures` 就说明正常。
 
-- 主列表里没有的卡片：直接复制过去
-- 主列表里已经删除的会话（有 `deleted_<id>` 墓碑）：不会被带回来
-- 只在被替换目录里删除、主列表里还在的会话：会重新显示，脚本会提示数量
-- 被替换目录里卡片以外的东西（定时任务、backlog 等）：如果和主列表里的同名文件内容相同，不提示；内容不同的，会列出来但不合并，定时任务会单独警告
-- 被替换的目录整个移到 `%USERPROFILE%\claude-session-link-backup\<时间>\`，不删除
-- 主列表里被覆盖的卡片，原始版本保存在备份的 `master-before\` 里。同一次运行中多次覆盖同一张卡片时，只保留最初那份
-- 脚本只按字节复制文件，从不改写卡片内容
+## 体检
 
-## 安全措施
+```powershell
+powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\.claude-session-sync\Check-ClaudeSwitch.ps1"
+```
 
-- **Claude 桌面端在运行时拒绝执行 `-Apply`。** 判断依据是各数据目录里的 `lockfile` 是否被占用。
-- **遇到链接目录时不动手。** 会话根目录（`claude-code-sessions`）本身是链接时直接拒绝；账号目录是链接时跳过；如果更上层的目录是链接，移动之前会先写一个探针文件，确认这个目录和主列表不是同一个物理目录。
-- **备份目录必须和会话目录在同一个盘上**，保证移动是原子操作。
-- **建好联接后会读回来核对**，确认它指向主列表。
-- **失败时尽量恢复原样。** 建联接失败时，目录会被移回原处；如果连移回都失败，会告诉你目录现在在哪。已经合并进主列表的卡片会留在主列表里。
-- **主列表标记只在至少成功链接了一个登录后才写入**，失败的运行不会把主列表固定下来。
-- **读不了的文件不会让整个运行中止。** 比如被别的程序锁住的文件，会被当作"内容不同"列出来，保留在备份里。
+只读，Claude 开着也能跑。检查内容：
 
-## 必须满足的前提
+- 所有登录方式的列表是否一致，有没有联接文件夹；
+- **桌面端日志里有没有卡片保存失败**（官方和第三方两边的日志都看）；
+- 有没有对话已经没有卡片；
+- 有没有设置 `CLAUDE_CONFIG_DIR`；
+- 对话保留期；
+- hook 是否已安装，最近一次同步的结果；
+- CC Switch 的每个 Claude 渠道是否启用了通用配置；
+- `claude doctor` 是否认为 `settings.json` 有效（只要有一个值不合法，Claude Code 会忽略整个文件，所有插件和 hooks 都会悄悄失效）。
 
-- **所有登录用同一个 `~/.claude`。** 不要给不同账号设置不同的 `CLAUDE_CONFIG_DIR`，否则某个登录找不到对话文件，会把共用的卡片标成"找不到对话"，所有登录都受影响。体检脚本会检查这一点。
-- **不要同时运行官方和第三方两个桌面端实例。**
-- **切换前等 Claude 回完当前这一轮。** 桌面端换号时会结束正在运行的会话。
+## 出问题时
 
-## 共享了什么，没共享什么
+- **误删了一个对话**：`Restore-ClaudeSession.ps1 -Id <对话ID>` 会从备份里找回卡片，写回所有登录方式，并清掉删除标记。然后切一次号或重启 Claude 就能看到。
+- **有对话已经没有卡片**（体检会报出来）：在普通终端窗口里运行 `claude --desktop --resume <对话ID>`，桌面端会打开这个对话并补建卡片。菜单里的"帮助 → 故障排查 → 导入 Claude Code CLI 会话"只能找回在终端里开的对话。
+- **卸载**：`Uninstall-SyncHook.ps1`。它只删除本项目的 hooks（`settings.json` 和 CC Switch 两边）、桌面快捷方式和安装的脚本；你的其他设置、所有卡片和备份都保留。
 
-| 共享（都在本机） | 不共享 |
-|---|---|
-| 会话列表、对话内容 | claude.ai 云端连接器（Google Drive、Claude Docs 等），以及发布的 Artifact |
-| `~/.claude` 下的 skill、插件、hooks、CLAUDE.md | 账号同步下来的 skill（`skills-plugin` 目录归桌面端管理，会按登录方式重写）。需要的话复制一份到 `~/.claude/skills` |
-| 用户级 MCP（`~/.claude.json`） | 侧边栏自建分组（存在桌面端 Local Storage，按账号和服务器同步） |
-| 主列表里的定时任务（在当前登录的账号下运行） | 每个账号的"跳过权限确认"开关、Remote Control |
+## 为什么不能用联接（junction）
 
-## 换后端接着跑，要知道的事
+最直接的想法是：把各个登录方式的卡片文件夹做成指向同一个文件夹的联接。本项目的旧版就是这么做的，结果是：
 
-- **之前的思考过程会被丢掉。** 换账号或换中转后，接口会丢掉旧的思考块，Claude 重读对话后继续，内容不会丢。Claude Code 会自动处理签名错误，前提是中转把上游错误原样返回。
-- **第一条消息更耗额度。** prompt 缓存按账号区分，换号后第一轮要重新计算。
-- **中转返回的不一定是 Claude 模型。** 有的中转、或 CC Switch 的模型映射，会把 `claude-*` 映射成别家模型，这种情况谈不上无损。
-- **用过联网搜索的会话，切到非 Anthropic 后端前先 `/compact`。**
-- **建议在 `settings.json` 里设置 `"cleanupPeriodDays": 3650`。** 默认 30 天后会删除较早的对话。
+- **读取正常**：换号后能看到列表。
+- **保存被拒绝**：桌面端每次保存卡片前都会检查，`<账号>\<组织>` 这一层必须是真实文件夹，而且真实路径要和表面路径一致。否则报错 `Refusing non-directory at private dir path (symlink/file plant)`，然后放弃保存。
+- **后果**：在被联接的登录方式里新建的对话、以及压缩上下文后卡片的更新，都只存在内存里，桌面端一重启就消失。已有对话的卡片会停留在旧的正文文件上，再打开就接回了旧进度。
 
-## CC Switch 用户
+更上层的目录可以做链接，但每个登录方式最底层那个文件夹的名字各不相同，所以没法让它们变成同一个文件夹。单个卡片文件做硬链接也会被拒绝。真正共用同一个文件夹，在目前的桌面端上做不到，所以只能靠同步。
 
-CC Switch 3.20.4 切换渠道时会**整个重写** `~/.claude/settings.json`。没勾"写入通用配置"的渠道，切过去后插件、hooks、权限、状态栏都会丢（[cc-switch#6871](https://github.com/farion1231/cc-switch/issues/6871)）。
+## 前提与限制
 
-修法：在 CC Switch 的通用配置片段里放好你的设置，并在**每个** Claude 渠道上勾选"写入通用配置"。装了 Python 时，体检脚本会检查这一项，并核对通用配置里的键都还在 `settings.json` 里。
-
-**`settings.json` 里只要有一个值不合法，Claude Code 就会忽略整个文件**，所有插件、hooks、权限一起失效，而且不会弹任何提示。例如某些版本只接受字符串形式的 `"attribution": {"commit": "", "pr": ""}`，写成 `false` 就会触发。所以体检脚本会调用 `claude doctor`，它报告 "Invalid settings" 时判为 FAIL。
-
-CC Switch 给桌面端第三方模式用的是一个固定的配置 ID，所以在 CC Switch 里换中转不会产生新目录。第一次用 CC Switch，或者改用别的第三方配置方式时，可能会多出一个目录，体检会提示，再接入一次就行。
-
-## 撤销与恢复
-
-**撤销链接**：退出 Claude 后运行 `Unlink-ClaudeAccounts.ps1 -Apply`。
-
-- 每个联接会变回独立目录，里面放一份主列表的完整副本，包括卡片、墓碑和定时任务。脚本会先复制到临时目录，复制成功后才替换联接。替换失败时，会把联接重新建回去。
-- 主列表本身不变，合并时做的改动也不会撤回。
-
-**主列表丢失了**（比如商店版被重置或卸载，所有联接都指向一个已经不存在的目录）：
-
-- 备份文件夹里只有各个登录在链接之前的原目录，**没有主列表本身**。
-- 如果你自己备份过主列表，把它放回原位置即可。
-- 否则运行 `Unlink-ClaudeAccounts.ps1 -Apply -AllowEmpty`，把断掉的联接换成空目录，从头开始。需要的话，再从 `claude-session-link-backup` 里取回某个登录原来的目录。
-
-**把某个目录恢复成链接之前的原样**：先执行上面的撤销，再用 `claude-session-link-backup\<时间>\<账号>__<组织>\` 里的内容替换那个目录。一定要先撤销：如果直接往联接里复制，文件会写进主列表。
-
-## 风险说明
-
-- 桌面端的存储格式不是公开接口，以后的版本可能改变。
-- 主列表通常在官方数据目录里。**卸载商店版、在"设置 → 应用"里重置 Claude、或者在 App 里重置应用数据**，都会清空主列表，所有登录一起受影响。做这些操作前，先运行 `Unlink-ClaudeAccounts.ps1 -Apply`，或者备份主列表目录。
+- 所有登录方式要用同一个 `~/.claude`。不要给不同账号设置不同的 `CLAUDE_CONFIG_DIR`，否则正文就分开了。
+- 不要同时开着官方模式和第三方模式两个桌面端实例。
+- 不共享的内容：claude.ai 的云端连接器（Google Drive、Claude Docs 等）和已发布的 Artifact；账号同步下来的 skill（`skills-plugin` 目录归桌面端管理）；侧边栏的自建分组；每个账号各自的"跳过权限确认"开关。
+- 换账号或换中转后，之前各轮的"思考过程"会被接口丢掉，Claude 会重读对话再继续，文字内容完整。第一轮因为缓存失效会多耗一些额度。如果中转把 `claude-*` 映射成了别家模型，那就不是同一个模型了。
+- 桌面端的存储格式不是公开接口，以后的版本可能改变。到时体检会报出来，你的对话正文不受影响。
 - 本项目与 Anthropic 无关。
-
-## 测试
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1
-```
-
-测试在 `%TEMP%` 下搭建一套假的目录结构，跑完会清理。测试不会修改本机的真实数据；不过体检相关的用例会只读地读取本机的 `settings.json` 和 CC Switch 数据库。`claude doctor` 那一项用假的 `claude` 程序测试，不会运行真的 CLI。
-
-覆盖的情况有：
-
-- 空跑不改动任何东西
-- 合并规则，以及备份里保留的是最初的原件
-- 重复运行没有副作用
-- 新出现的登录能被接入
-- 撤销后再链接，主列表不变，也不误报定时任务
-- 有多个官方账号时，主列表保持不变
-- Claude 运行时拒绝执行
-- 文件被占用时安全失败
-- 坏卡片、带 BOM 的卡片、截断的卡片不会扩散
-- `lastActivityAt` 相同时按文件修改时间判断
-- 数据目录本身是链接时拒绝执行
-- 路径含空格、方括号、中文时正常
-- 备份目录在别的盘上时拒绝执行
-- 主列表丢失时的体检结果和撤销行为，以及 `-AllowEmpty`
-- `claude doctor` 报告设置无效时，体检判为 FAIL
-- 撤销中途失败时联接保持原样
-- 链接全部失败时不写主列表标记
-- 读不了的文件不会中止运行
-
-开发环境：Windows 11、Windows PowerShell 5.1、Claude 桌面端商店版 2.19675.0、CC Switch 3.20.4。
 
 ## 文件
 
 | 文件 | 作用 |
 |---|---|
-| `Link-ClaudeAccounts.ps1` | 合并并链接，默认空跑 |
-| `Connect-NewLogin.ps1` | 双击用的中文引导，内部调用 Link 和 Check |
-| `Check-ClaudeSwitch.ps1` | 只读体检：共享列表和链接、坏卡片、`CLAUDE_CONFIG_DIR`、对话保留期、CC Switch 通用配置，以及用 `claude doctor` 确认 `settings.json` 有效 |
-| `Unlink-ClaudeAccounts.ps1` | 撤销链接 |
-| `common.ps1` | 公共函数 |
-| `tests\Run-Tests.ps1` | 自动化测试 |
+| `Install-SyncHook.ps1` / `Uninstall-SyncHook.ps1` | 安装 / 卸载 |
+| `Sync-ClaudeSessions.ps1` | 同步本体（hooks 调用它） |
+| `Check-ClaudeSwitch.ps1` | 只读体检 |
+| `Restore-ClaudeSession.ps1` | 从备份恢复一个对话的卡片 |
+| `Unlink-ClaudeAccounts.ps1` | 把旧版的联接文件夹换回普通文件夹（安装脚本会自动调用） |
+| `Sync-Now.ps1` | 桌面快捷方式：立即同步并体检 |
+| `common.ps1`、`hooks.ps1` | 公共函数 |
+| `tests\Run-Tests.ps1` | 75 项自动化测试，全部在 `%TEMP%` 的假目录里运行 |
 
-## 相关项目
+测试覆盖：
 
-- [alksdesu/ClaudePlusPlus](https://github.com/alksdesu/ClaudePlusPlus)：同样用 junction 统一会话池，是带托盘守护的 Tauri 应用
-- [RasmusKD/claude-desktop-session-sync](https://github.com/RasmusKD/claude-desktop-session-sync)：每 5 分钟用计划任务复制同步一次，同时同步分组和定时任务。"完好的卡片优先"这条规则借鉴自它
-- [ramonmazinga/claude-code-multi-account-bridge](https://github.com/ramonmazinga/claude-code-multi-account-bridge)、[craigstoller/claude-code-sessions](https://github.com/craigstoller/claude-code-sessions)、[brunoflma/claude-session-linker](https://github.com/brunoflma/claude-session-linker)、[vitaliyhayda/claude-transplant](https://github.com/vitaliyhayda/claude-transplant)：复制或迁移类的方案
-- 官方 issue：[#74662](https://github.com/anthropics/claude-code/issues/74662)、[#97295](https://github.com/anthropics/claude-code/issues/97295)、[#48511](https://github.com/anthropics/claude-code/issues/48511)
+- 合并、过时卡片、`/clear` 和压缩、墓碑与恢复；
+- 损坏、带 BOM、截断、正在写入、被锁住的卡片；
+- 联接文件夹、补跑、备份清理、中文和特殊字符路径；
+- 体检的各项判断；
+- 安装和卸载：其他设置不变、重复安装逐字节一致、CC Switch 配置。
 
-和这些方案相比，本项目不做持续的复制或同步，也不常驻后台：只在链接时合并一次，之后各个目录都指向同一处。
+开发环境：Windows 11、Windows PowerShell 5.1、Claude 桌面端商店版 2.31226、Claude Code 2.1.290、CC Switch 3.20.4。
+
+## 相关项目与 issue
+
+- 复制或迁移类方案：[RasmusKD/claude-desktop-session-sync](https://github.com/RasmusKD/claude-desktop-session-sync)、[ramonmazinga/claude-code-multi-account-bridge](https://github.com/ramonmazinga/claude-code-multi-account-bridge)、[craigstoller/claude-code-sessions](https://github.com/craigstoller/claude-code-sessions)、[brunoflma/claude-session-linker](https://github.com/brunoflma/claude-session-linker)、[vitaliyhayda/claude-transplant](https://github.com/vitaliyhayda/claude-transplant)。"完好的卡片优先"借鉴自 RasmusKD。
+- 用联接方案的：[alksdesu/ClaudePlusPlus](https://github.com/alksdesu/ClaudePlusPlus)，原因见上文，会遇到同样的保存问题。
+- 官方 issue：[#74662](https://github.com/anthropics/claude-code/issues/74662)、[#97295](https://github.com/anthropics/claude-code/issues/97295)、[#48511](https://github.com/anthropics/claude-code/issues/48511)、[#63082](https://github.com/anthropics/claude-code/issues/63082)。
 
 ---
 
 ## English
 
-Switching Claude accounts, or pointing Claude Desktop at a third-party gateway (e.g. with CC Switch), empties the Code tab's session list. The conversations themselves live in `~/.claude/projects` and are shared; only the list is stored per login, at `<userData>\claude-code-sessions\<account>\<org>\`. These scripts keep one real folder and replace every other account/org folder, in both the official and the `Claude-3p` profile, with an NTFS junction pointing at it, so every login reads and writes the same list. No admin rights, no background task, no app patching. Runs on Windows PowerShell 5.1; PowerShell 7 is untested.
+Switching Claude accounts in Claude Desktop, or pointing it at a third-party gateway (e.g. with CC Switch), changes the Code tab's session list, and earlier conversations seem to vanish. They don't: the conversations live in `~/.claude/projects` and are shared. What changes is the per-login folder of session **cards** at `<userData>\claude-code-sessions\<account>\<org>\local_*.json`. This project keeps those cards identical for every login, so after a switch you see the same list and continue where you left off.
 
-**Scripts**
+> ⚠️ Versions before 2026-10-09 used NTFS junctions. **Claude Desktop refuses to save cards into a junctioned folder** (`Refusing non-directory at private dir path (symlink/file plant)`). Sessions created or updated under a linked login lived only in memory and disappeared on restart, and other sessions resumed an old transcript. Please upgrade; the installer turns old junctions back into real folders.
 
-- `Link-ClaudeAccounts.ps1` merges records into the master, then links each other folder.
-  - Dry run by default; `-Apply` to act. Refuses while Claude Desktop is running (lockfile check).
-  - The master is the official profile's biggest folder. It is then marked with `.claude-session-link-master`, so it stays the master after unlink and relink.
-  - When both sides hold a record, the winner is decided in this order: readable beats unreadable (BOM, empty, invalid or truncated JSON); healthy beats transcript-unlinked; newer `lastActivityAt`; newer file time.
-  - Master tombstones are respected. The master's original copies and the replaced folders are kept in a same-drive backup.
-  - Linked roots are refused; a probe file guards against moving the master; the new link is read back and verified; a failed link rolls the folder back.
-- `Connect-NewLogin.ps1` is a guided, double-click wrapper (Chinese prompts).
-- `Check-ClaudeSwitch.ps1` is a read-only health check: one shared list, valid links, missing master, unreadable or unlinked records, `CLAUDE_CONFIG_DIR`, transcript retention, CC Switch common-config coverage, and `settings.json` validity via `claude doctor` (one invalid value makes Claude Code ignore the whole file, silently turning off every plugin, hook and permission; use `-SkipDoctor` to skip this check).
-- `Unlink-ClaudeAccounts.ps1` turns links back into real folders, each holding a full copy of the list. It stages the copy first and restores the link if the swap fails. If the master is missing it refuses; `-AllowEmpty` replaces the broken links with empty folders. The backup holds each login's folder from before linking, never the shared list itself.
-- `common.ps1` holds shared helpers. `tests\Run-Tests.ps1` runs self-contained tests on fake folders under `%TEMP%`; they read the real `settings.json` and CC Switch database read-only, and never modify them.
+**How it works.** Claude Code [hooks](https://code.claude.com/docs/en/hooks) run `Sync-ClaudeSessions.ps1` at these points:
 
-**Requirements:** every login uses the same `~/.claude` (no per-account `CLAUDE_CONFIG_DIR`); don't run the official and third-party desktop instances at once; switch between turns, not during one.
+- `Stop`, followed by short-lived follow-ups at about +3 s and +10 s (Desktop writes a turn's last card update after the hook returns);
+- `StopFailure`, e.g. a rate limit, which is exactly when people switch;
+- `SessionStart` and `SessionEnd`.
 
-**Not shared:** claude.ai connectors, account-synced skills, sidebar custom groups, per-account permission opt-ins.
+There is no resident process and no scheduled task, and the app is not patched. It runs on Windows PowerShell 5.1 only and needs no network. It never reads or writes transcripts and prints nothing in hook mode, so it costs no tokens.
 
-Uninstalling or resetting the Store app wipes the shared list for every login, so unlink or back up first. Independent project, not affiliated with Anthropic. MIT license.
+**Merge rules.** For each card, the best copy goes to every login, chosen in this order:
+
+1. Readable. BOM, empty or broken JSON never spreads. A broken copy changed in the last 15 s is treated as being written and left alone.
+2. Not out of date. A copy whose `cliSessionId` appears in another copy's `priorCliSessionIds` or `preClearCliSessionId` never wins, so you never resume an old point of a conversation after a compaction or `/clear`.
+3. Not marked `transcriptUnavailable`.
+4. Newer `lastActivityAt`, then newer file time.
+
+Other rules:
+
+- Deletions (`deleted_<id>` tombstones) propagate unless the card changed afterwards.
+- Unreadable cards and unlistable folders are not written that run.
+- Writes are atomic, and reads share access so the app is never blocked.
+
+**Backups** live in `%USERPROFILE%\claude-session-sync-backup`:
+
+- daily snapshots, kept 14 days;
+- deduplicated pre-change copies, kept 3 days;
+- a 300 MB cap on the whole folder;
+- `sync.log`, which rotates at 1 MB.
+
+**Install:** `powershell -ExecutionPolicy Bypass -File .\Install-SyncHook.ps1`. It:
+
+1. copies the scripts to `%USERPROFILE%\.claude-session-sync`;
+2. converts old junctions to real folders (quit Claude first if any exist);
+3. adds the hooks to `~/.claude/settings.json`, leaving every other setting byte-for-byte as it was, idempotently and with a backup;
+4. mirrors the hooks into CC Switch's common config if CC Switch is installed (needs Python);
+5. syncs once, runs the health check and adds a desktop shortcut.
+
+**Use:** nothing to do. Switch accounts after Claude finishes a reply. A brand-new login may show an empty list the first time; switch away and back, or restart Claude, once.
+
+**Health check:** `Check-ClaudeSwitch.ps1`, read-only. It checks:
+
+- that every list is the same and no folder is a link;
+- failed card saves in the official and Claude-3p Desktop logs;
+- conversations without a card;
+- `CLAUDE_CONFIG_DIR`;
+- transcript retention;
+- that the hook is installed, and the last sync's result;
+- CC Switch common-config coverage;
+- `settings.json` validity via `claude doctor`.
+
+**Recovery:**
+
+- `Restore-ClaudeSession.ps1 -Id <id>` brings back a deleted card from the backups.
+- `claude --desktop --resume <id>`, run in a normal console window, re-creates a missing card. The Help > Troubleshooting import only finds sessions started in a terminal.
+- `Uninstall-SyncHook.ps1` removes only this project's hooks, shortcut and scripts.
+
+**Why not junctions:** Claude Desktop requires each `<account>\<org>` folder to be a real directory whose real path equals its own path, and refuses hard-linked card files. Links above that level are allowed, but every login's folder has a different name, so one physical folder for all logins is impossible without patching the app.
+
+**Limits:**
+
+- Every login must use the same `~/.claude` (no per-account `CLAUDE_CONFIG_DIR`).
+- Don't run the official and the third-party Desktop instances at the same time.
+- Not shared: claude.ai connectors and published artifacts, account-synced skills, sidebar custom groups, and per-account permission opt-ins.
+- After a switch, prior thinking blocks are dropped by the API, while the text history is intact.
+- The storage format is not a public API; the health check will flag changes.
+
+Not affiliated with Anthropic. MIT license.

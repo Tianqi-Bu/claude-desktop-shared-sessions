@@ -1,7 +1,8 @@
-# Undo Link-ClaudeAccounts.ps1: turn every linked account/org folder (official and
-# third-party profile) back into a real folder holding a full COPY of the shared list
-# (records, tombstones, scheduled tasks, everything). The master is not changed.
-# The folders as they were before linking are in %USERPROFILE%\claude-session-link-backup\.
+# Migration from the old junction version of this project: turn every account/org folder
+# that is a link (official and third-party profile) back into a real folder holding a full
+# COPY of the list it pointed at (records, tombstones, scheduled tasks, everything).
+# Claude Desktop refuses to save session cards into a link, so links must go.
+# Install-SyncHook.ps1 runs this automatically. The folder that was linked to is not changed.
 #
 # Quit Claude Desktop completely (tray icon -> Quit) before running with -Apply.
 #   powershell -ExecutionPolicy Bypass -File .\Unlink-ClaudeAccounts.ps1          # dry run, changes nothing

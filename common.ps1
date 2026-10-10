@@ -122,35 +122,87 @@ function Get-Leaves([string[]]$roots) {
     return ,$leaves
 }
 
-# Facts about one session record, read as bytes (no JSON parser: records can hold text
-# PowerShell 5.1 mis-decodes, and the app skips files a parser would happily accept).
-#   Usable:  the app can read it - non-empty, no UTF-8 BOM, starts with '{'
-#   Healthy: still linked to its transcript; the app strips cliSessionId and sets
-#            transcriptUnavailable when it cannot find the transcript (anthropics/claude-code#63082)
-function Get-RecordInfo([string]$path) {
-    $bytes = [byte[]]@()
-    try { $bytes = [IO.File]::ReadAllBytes($path) } catch {}
+# Read a file without blocking the app: share read, write and delete, so the app's
+# own tmp+rename saves never fail because we have the file open.
+function Read-SharedBytes([string]$path) {
+    $fs = New-Object IO.FileStream($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try { $ms = New-Object IO.MemoryStream; $fs.CopyTo($ms); return ,$ms.ToArray() } finally { $fs.Dispose() }
+}
+
+function Get-JsonField($obj, [string]$name) {
+    if ($obj -is [System.Collections.IDictionary]) { if ($obj.ContainsKey($name)) { return $obj[$name] } else { return $null } }
+    return $obj.$name
+}
+
+# Facts about one session card, from its bytes.
+#   Usable:   the app can read it - no UTF-8 BOM, starts with '{', parses as a JSON object
+#   Damaged:  the app marked it transcriptUnavailable (anthropics/claude-code#63082). A card
+#             WITHOUT cliSessionId is normal (e.g. right after /clear) and is not damaged.
+#   Cli:      cliSessionId, the conversation file the card resumes
+#   Prior:    conversation files this card has moved on from (priorCliSessionIds and
+#             preClearCliSessionId); a copy still pointing at one of them is out of date
+function Get-RecordInfoFromBytes([byte[]]$bytes, [datetime]$writeTimeUtc) {
     $bom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
     $text = [Text.Encoding]::UTF8.GetString($bytes)
-    # the app JSON.parses the file: first byte must be '{' (ASCII whitespace allowed) and the whole thing must parse
     $trim = $text.TrimStart([char[]]@(' ', "`t", "`r", "`n"))
-    $usable = (-not $bom) -and $trim.Length -gt 0 -and $trim[0] -eq [char]'{' -and (Test-JsonObject $text)
-    $healthy = $usable -and ($text -match '"cliSessionId"\s*:\s*"[0-9a-fA-F-]{36}"') -and ($text -notmatch '"transcriptUnavailable"\s*:\s*true')
-    $m = [regex]::Match($text, '"lastActivityAt"\s*:\s*(\d+)')
+    $obj = $null
+    if (-not $bom -and $trim.Length -gt 0 -and $trim[0] -eq [char]'{') {
+        try {
+            if ($script:JsonSer) { $o = $script:JsonSer.DeserializeObject($text); if ($o -is [System.Collections.IDictionary]) { $obj = $o } }
+            else { $o = $text | ConvertFrom-Json -ErrorAction Stop; if ($o -is [psobject]) { $obj = $o } }
+        } catch { $obj = $null }
+    }
+    $cli = ''; $prior = @(); $act = [int64]0; $damaged = $false
+    if ($obj -ne $null) {
+        $v = Get-JsonField $obj 'cliSessionId'; if ($v) { $cli = [string]$v }
+        foreach ($p in @(Get-JsonField $obj 'priorCliSessionIds')) { if ($p) { $prior += [string]$p } }
+        $v = Get-JsonField $obj 'preClearCliSessionId'; if ($v) { $prior += [string]$v }
+        $v = Get-JsonField $obj 'lastActivityAt'; if ($v -ne $null) { try { $act = [int64]$v } catch {} }
+        $damaged = (Get-JsonField $obj 'transcriptUnavailable') -eq $true
+    }
     [pscustomobject]@{
-        Usable    = $usable
-        Healthy   = $healthy
-        Activity  = $(if ($m.Success) { [int64]$m.Groups[1].Value } else { [int64]0 })
-        WriteTime = (Get-Item -LiteralPath $path -Force).LastWriteTimeUtc
+        Usable    = ($obj -ne $null)
+        Damaged   = $damaged
+        Healthy   = (($obj -ne $null) -and -not $damaged)
+        Cli       = $cli
+        Prior     = $prior
+        Activity  = $act
+        WriteTime = $writeTimeUtc
     }
 }
 
-# Should the incoming copy of a record replace the master's copy?
-# usable beats unusable, healthy beats damaged, then newer lastActivityAt, then newer file time.
-function Test-IncomingWins([string]$incoming, [string]$current) {
-    $a = Get-RecordInfo $incoming; $b = Get-RecordInfo $current
-    if ($a.Usable -ne $b.Usable) { return $a.Usable }
-    if ($a.Healthy -ne $b.Healthy) { return $a.Healthy }
-    if ($a.Activity -ne $b.Activity) { return $a.Activity -gt $b.Activity }
-    return $a.WriteTime -gt $b.WriteTime
+function Get-RecordInfo([string]$path) {
+    $bytes = [byte[]]@()
+    try { $bytes = Read-SharedBytes $path } catch {}
+    $wt = [datetime]::MinValue
+    try { $wt = [IO.File]::GetLastWriteTimeUtc($path) } catch {}
+    return Get-RecordInfoFromBytes $bytes $wt
+}
+
+# Pick the copy every login should get. Order:
+#   1. readable by the app
+#   2. not out of date: a copy whose cliSessionId another copy lists as a prior / pre-clear
+#      conversation must never win (that would resume an old point of the conversation)
+#   3. not damaged (transcriptUnavailable)
+#   4. newer lastActivityAt, then newer file time
+# $copies: objects with an .Info property from Get-RecordInfo*. Returns $null if none is readable.
+function Select-BestCopy($copies) {
+    $usable = @($copies | Where-Object { $_.Info.Usable })
+    if ($usable.Count -eq 0) { return $null }
+    $stale = New-Object bool[] $usable.Count
+    for ($i = 0; $i -lt $usable.Count; $i++) {
+        $ci = $usable[$i].Info.Cli
+        if (-not $ci) { continue }
+        for ($j = 0; $j -lt $usable.Count; $j++) {
+            $o = $usable[$j].Info
+            if ($o.Cli -ne $ci -and ($o.Prior -contains $ci)) { $stale[$i] = $true; break }
+        }
+    }
+    $bi = 0
+    for ($i = 1; $i -lt $usable.Count; $i++) {
+        $a = $usable[$i].Info; $b = $usable[$bi].Info
+        $better = if ($stale[$i] -ne $stale[$bi]) { -not $stale[$i] } elseif ($a.Damaged -ne $b.Damaged) { -not $a.Damaged } elseif ($a.Activity -ne $b.Activity) { $a.Activity -gt $b.Activity } else { $a.WriteTime -gt $b.WriteTime }
+        if ($better) { $bi = $i }
+    }
+    return $usable[$bi]
 }
